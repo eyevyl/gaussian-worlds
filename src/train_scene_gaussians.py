@@ -17,25 +17,25 @@ IMAGE_DIR = DATA_DIR / "images_8"
 SPARSE_DIR = DATA_DIR / "colmap/sparse/0"
 OUTPUT_DIR = Path("outputs/scene_training")
 
-NUM_TRAINING_IMAGES = 8
-RANDOM_SEED = 42
+HOLDOUT_STRIDE = 5
 
-NUM_TRAINING_STEPS = 500
-PRINT_EVERY = 25
+NUM_TRAINING_STEPS = 2000
+PRINT_EVERY = 100
+RANDOM_SEED = 42
 
 MINIMUM_SCALE = 0.001
 MAXIMUM_SCALE = 0.5
 
 
-def select_training_images(
+def split_training_and_heldout_images(
     reconstruction,
     image_directory,
-    number_of_images,
+    holdout_stride,
 ):
     """
-    Select registered COLMAP images that also exist in images_8.
+    Create an interleaved train/held-out split.
 
-    The selected images are spread out across the full camera sequence to better leverage parallax. 
+    Every holdout_stride-th matching image is reserved for evaluation.
     """
 
     downloaded_names = {
@@ -50,32 +50,18 @@ def select_training_images(
         if image.name in downloaded_names
     ]
 
-    # Sort files by temporal order
     matching_images.sort(key=lambda image: image.name)
 
-    if len(matching_images) < number_of_images:
-        raise RuntimeError(
-            f"Requested {number_of_images} training images, "
-            f"but only found {len(matching_images)} matching images."
-        )
+    training_images = []
+    heldout_images = []
 
-    # Example for 100 images and 8 selections:
-    #
-    # linspace creates positions spread approximately like:
-    # [0, 14, 28, 42, 57, 71, 85, 99]
-    selected_indices = np.linspace(
-        0,
-        len(matching_images) - 1,
-        number_of_images,
-        dtype=int,
-    )
+    for index, image in enumerate(matching_images):
+        if index % holdout_stride == 0:
+            heldout_images.append(image)
+        else:
+            training_images.append(image)
 
-    selected_images = [
-        matching_images[index]
-        for index in selected_indices
-    ]
-
-    return selected_images, len(matching_images)
+    return training_images, heldout_images, len(matching_images)
 
 
 def load_training_view(
@@ -699,15 +685,16 @@ def main():
     device = torch.device("cuda")
     reconstruction = pycolmap.Reconstruction(SPARSE_DIR)
 
-    training_images, matching_count = select_training_images(
+    training_images, heldout_images, matching_count = split_training_and_heldout_images(
         reconstruction=reconstruction,
         image_directory=IMAGE_DIR,
-        number_of_images=NUM_TRAINING_IMAGES,
+        holdout_stride=HOLDOUT_STRIDE,
     )
 
     print(f"Device: {device}")
     print(f"Registered/downloaded image matches: {matching_count}")
     print(f"Selected training images: {len(training_images)}")
+    print(f"Reserved held-out images: {len(heldout_images)}")
 
     print("\nTraining views:")
 
