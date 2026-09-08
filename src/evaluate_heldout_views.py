@@ -122,7 +122,8 @@ def main():
     print(
         "\nHeld-out results: "
         f"mean L1={metrics['mean_l1']:.6f}, "
-        f"mean PSNR={metrics['mean_psnr']:.2f} dB"
+        f"mean PSNR={metrics['mean_psnr']:.2f} dB, "
+        f"mean SSIM={metrics['mean_ssim']:.4f}"
     )
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)

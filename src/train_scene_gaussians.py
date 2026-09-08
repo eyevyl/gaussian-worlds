@@ -26,6 +26,8 @@ RANDOM_SEED = 42
 MINIMUM_SCALE = 0.001
 MAXIMUM_SCALE = 0.5
 
+SSIM_WEIGHT = 0.2
+
 
 def split_training_and_heldout_images(
     reconstruction,
@@ -93,9 +95,7 @@ def load_training_view(
 
     height, width = target_image.shape[:2]
 
-    # ---------------------------------------------------------
-    # World-to-camera transformation
-    # ---------------------------------------------------------
+    # 1. World-to-camera transformation
 
     cam_from_world = colmap_image.cam_from_world()
 
@@ -117,9 +117,7 @@ def load_training_view(
         device=device,
     )[None]
 
-    # ---------------------------------------------------------
-    # Camera intrinsics
-    # ---------------------------------------------------------
+    # 2. Camera intrinsics
 
     scale_x = width / camera.width
     scale_y = height / camera.height
@@ -136,9 +134,7 @@ def load_training_view(
         dtype=torch.float32,
     )[None]
 
-    # ---------------------------------------------------------
-    # OPENCV lens-distortion parameters
-    # ---------------------------------------------------------
+    # 3. OPENCV lens-distortion parameters
 
     if len(camera.params) != 8:
         raise RuntimeError(
@@ -349,8 +345,7 @@ def run_gradient_check(
 
     psnr = -10.0 * torch.log10(mse)
 
-    # Calculate derivatives of the loss with respect to every
-    # trainable Gaussian parameter.
+    # Calculate derivatives of the loss with respect to every trainable Gaussian parameter.
     loss.backward()
 
     print(f"\nGradient check using: {view['name']}")
@@ -533,6 +528,7 @@ def evaluate_training_views(
 ):
     l1_values = []
     psnr_values = []
+    ssim_values = []
 
     with torch.no_grad():
         for view in training_views:
@@ -555,12 +551,19 @@ def evaluate_training_views(
                 mse.clamp_min(1e-10)
             )
 
+            ssim = compute_ssim(
+                rendered_image,
+                view["target"],
+            )
+
             l1_values.append(l1.item())
             psnr_values.append(psnr.item())
+            ssim_values.append(ssim.item())
 
     return {
         "mean_l1": float(np.mean(l1_values)),
         "mean_psnr": float(np.mean(psnr_values)),
+        "mean_ssim": float(np.mean(ssim_values)),
     }
 
 
@@ -624,9 +627,10 @@ def train_gaussians(
             view=view,
         )
 
-        loss = F.l1_loss(
-            rendered_image,
-            view["target"],
+        loss, l1, ssim = calculate_reconstruction_loss(
+            rendered_image=rendered_image,
+            target_image=view["target"],
+            ssim_weight=SSIM_WEIGHT,
         )
 
         loss.backward()
@@ -670,9 +674,175 @@ def train_gaussians(
                 f"step={step:04d} "
                 f"view={view_index} "
                 f"name={view['name']} "
-                f"loss={loss.item():.6f} "
+                f"total={loss.item():.6f} "
+                f"l1={l1.item():.6f} "
+                f"ssim={ssim.item():.4f} "
                 f"recent_mean={recent_mean:.6f}"
             )
+
+
+def create_gaussian_window(
+    window_size,
+    sigma,
+    channels,
+    device,
+    dtype,
+):
+    """
+    Create a 2D Gaussian filter used to measure local image statistics.
+    """
+
+    coordinates = torch.arange(
+        window_size,
+        device=device,
+        dtype=dtype,
+    )
+
+    coordinates = coordinates - window_size // 2
+
+    gaussian_1d = torch.exp(
+        -(coordinates ** 2) / (2.0 * sigma ** 2)
+    )
+
+    gaussian_1d /= gaussian_1d.sum()
+
+    gaussian_2d = (
+        gaussian_1d[:, None]
+        * gaussian_1d[None, :]
+    )
+
+    window = gaussian_2d.expand(
+        channels,
+        1,
+        window_size,
+        window_size,
+    )
+
+    return window
+
+
+def compute_ssim(
+    image_a,
+    image_b,
+    window_size=11,
+    sigma=1.5,
+):
+    """
+    Calculate mean SSIM between two [height, width, channels] images.
+
+    Both images are expected to contain values in [0, 1].
+    """
+
+    # Convolution expects: [batch, channels, height, width]
+    image_a = image_a.permute(2, 0, 1)[None]
+    image_b = image_b.permute(2, 0, 1)[None]
+
+    channels = image_a.shape[1]
+
+    window = create_gaussian_window(
+        window_size=window_size,
+        sigma=sigma,
+        channels=channels,
+        device=image_a.device,
+        dtype=image_a.dtype,
+    )
+
+    padding = window_size // 2
+
+    # Reflection padding avoids introducing artificial black borders.
+    image_a = F.pad(
+        image_a,
+        (padding, padding, padding, padding),
+        mode="reflect",
+    )
+
+    image_b = F.pad(
+        image_b,
+        (padding, padding, padding, padding),
+        mode="reflect",
+    )
+
+    # Local means.
+    mean_a = F.conv2d(
+        image_a,
+        window,
+        groups=channels,
+    )
+
+    mean_b = F.conv2d(
+        image_b,
+        window,
+        groups=channels,
+    )
+
+    mean_a_squared = mean_a ** 2
+    mean_b_squared = mean_b ** 2
+    mean_ab = mean_a * mean_b
+
+    # Local variances and covariance.
+    variance_a = (
+        F.conv2d(
+            image_a ** 2,
+            window,
+            groups=channels,
+        )
+        - mean_a_squared
+    )
+
+    variance_b = (
+        F.conv2d(
+            image_b ** 2,
+            window,
+            groups=channels,
+        )
+        - mean_b_squared
+    )
+
+    covariance_ab = (
+        F.conv2d(
+            image_a * image_b,
+            window,
+            groups=channels,
+        )
+        - mean_ab
+    )
+
+    # SSIM stability constants for images in [0, 1].
+    c1 = 0.01 ** 2
+    c2 = 0.03 ** 2
+
+    ssim_map = (
+        (2.0 * mean_ab + c1)
+        * (2.0 * covariance_ab + c2)
+    ) / (
+        (mean_a_squared + mean_b_squared + c1)
+        * (variance_a + variance_b + c2)
+    )
+
+    return ssim_map.mean()
+
+
+def calculate_reconstruction_loss(
+    rendered_image,
+    target_image,
+    ssim_weight,
+):
+    l1 = F.l1_loss(
+        rendered_image,
+        target_image,
+    )
+
+    ssim = compute_ssim(
+        rendered_image,
+        target_image,
+    )
+
+    total = (
+        (1.0 - ssim_weight) * l1
+        + ssim_weight * (1.0 - ssim)
+    )
+
+    return total, l1, ssim
 
 
 def main():
@@ -812,7 +982,8 @@ def main():
     print(
         "\nBefore training: "
         f"mean L1={initial_metrics['mean_l1']:.6f}, "
-        f"mean PSNR={initial_metrics['mean_psnr']:.2f} dB"
+        f"mean PSNR={initial_metrics['mean_psnr']:.2f} dB, "
+        f"mean SSIM={initial_metrics['mean_ssim']:.4f}"
     )
 
     train_gaussians(
@@ -830,7 +1001,8 @@ def main():
     print(
         "\nAfter training: "
         f"mean L1={final_metrics['mean_l1']:.6f}, "
-        f"mean PSNR={final_metrics['mean_psnr']:.2f} dB"
+        f"mean PSNR={final_metrics['mean_psnr']:.2f} dB, "
+        f"mean SSIM={final_metrics['mean_ssim']:.4f}"
     )
 
     save_render_comparison(
